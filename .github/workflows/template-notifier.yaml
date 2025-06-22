@@ -2,7 +2,7 @@ name: Watch for New YAML Files
 
 on:
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '*/2 * * * *'
   workflow_dispatch:
 
 jobs:
@@ -10,41 +10,57 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # Step 1: Setup persistent notification history
-      - name: Setup notification history
-        id: setup
+      # Step 1: Restore notification history from cache
+      - name: Restore notification history
+        id: restore-history
+        uses: actions/cache@v4
+        with:
+          path: .notified/history.txt
+          key: nuclei-templates-notification-history
+          restore-keys: |
+            nuclei-templates-notification-history
+
+      # Step 2: Initialize history file if it doesn't exist
+      - name: Initialize history
         run: |
           mkdir -p .notified
           touch .notified/history.txt
-          # Create a clean copy without empty lines or duplicates
-          sort -u .notified/history.txt -o .notified/history.txt.tmp
-          mv .notified/history.txt.tmp .notified/history.txt
+          # Clean existing history file
+          sort -u .notified/history.txt -o .notified/history.txt
 
-      # Step 2: Get the latest commit SHA
-      - name: Get latest commit SHA
-        id: get_sha
+      # Step 3: Get current YAML files from repository
+      - name: Get current templates
+        id: get_templates
         run: |
-          SHA=$(curl -s https://api.github.com/repos/anderwordzkkkz/nuclei-templates/commits/main | jq -r .sha)
-          echo "sha=$SHA" >> $GITHUB_OUTPUT
-
-      # Step 3: Find all newly added YAML files
-      - name: Find new YAML files
-        id: find_files
-        run: |
+          # Get all YAML files from the repo
           curl -s https://api.github.com/repos/anderwordzkkkz/nuclei-templates/contents/ \
-          | jq -r '.[] | select(.name | endswith(".yaml")) | .name' > all_templates.txt
+          | jq -r '.[] | select(.name | endswith(".yaml")) | .name' > current_templates.txt
           
-          # Filter out already notified files
-          comm -23 <(sort all_templates.txt) <(sort .notified/history.txt) > new_templates.txt || true
-          echo "count=$(wc -l < new_templates.txt)" >> $GITHUB_OUTPUT
+          # Count total YAML files
+          echo "total=$(wc -l < current_templates.txt)" >> $GITHUB_OUTPUT
 
-      # Step 4: Send notification ONLY for truly new files
-      - name: Send Discord Notification
-        if: steps.find_files.outputs.count != '0'
+      # Step 4: Find new templates not in history
+      - name: Find new templates
+        id: find_new
+        run: |
+          # Find only files that exist in current_templates.txt but not in history
+          comm -23 <(sort current_templates.txt) <(sort .notified/history.txt) > new_templates.txt || true
+          
+          # Count new templates
+          echo "new_count=$(wc -l < new_templates.txt)" >> $GITHUB_OUTPUT
+          
+          # If no new templates, exit early
+          if [ ! -s new_templates.txt ]; then
+            echo "No new templates found"
+            exit 0
+          fi
+
+      # Step 5: Send notification for new templates
+      - name: Notify new templates
+        if: steps.find_new.outputs.new_count != '0'
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
-          # Send notification
           MESSAGE="🧩 **New Nuclei YAML Templates Added!**"
           while read FILE; do
             MESSAGE="$MESSAGE\n- \`$FILE\` <https://github.com/anderwordzkkkz/nuclei-templates/blob/main/$FILE>"
@@ -53,13 +69,13 @@ jobs:
           echo -e "$MESSAGE" | jq -Rs '{content: .}' > payload.json
           curl -H "Content-Type: application/json" -X POST -d @payload.json "$DISCORD_WEBHOOK"
 
-          # Update history IMMEDIATELY after successful notification
+          # Update history with newly notified files
           cat new_templates.txt >> .notified/history.txt
           sort -u .notified/history.txt -o .notified/history.txt
 
-      # Step 5: Persist the notification history
+      # Step 6: Save updated history
       - name: Save notification history
         uses: actions/cache@v4
         with:
           path: .notified/history.txt
-          key: notified-history-${{ hashFiles('.notified/history.txt') }}
+          key: nuclei-templates-notification-history-${{ hashFiles('.notified/history.txt') }}
