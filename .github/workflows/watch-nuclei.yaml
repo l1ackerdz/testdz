@@ -1,0 +1,111 @@
+name: Watch for New YAML Files
+
+on:
+  schedule:
+    - cron: '*/2 * * * *'
+  workflow_dispatch:
+
+jobs:
+  notify_new_yaml:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Restore last SHA & history cache
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            .last_sha
+            .notified/history.txt
+          key: notification-history-cache
+
+      - name: Get latest commit SHA
+        id: get_sha
+        run: |
+          SHA=$(curl -s https://api.github.com/repos/anderwordzkkkz/nuclei-templates/commits/main | jq -r .sha)
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
+
+      - name: Load previous SHA
+        id: load_sha
+        run: |
+          if [ -f .last_sha ]; then
+            echo "old_sha=$(cat .last_sha)" >> $GITHUB_OUTPUT
+          else
+            echo "old_sha=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Compare and get added YAMLs
+        id: compare
+        run: |
+          OLD_SHA="${{ steps.load_sha.outputs.old_sha }}"
+          NEW_SHA="${{ steps.get_sha.outputs.sha }}"
+
+          if [ -z "$OLD_SHA" ]; then
+            echo "$NEW_SHA" > .last_sha
+            echo "count=0" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          if [ "$OLD_SHA" = "$NEW_SHA" ]; then
+            echo "No new commits"
+            echo "count=0" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "$NEW_SHA" > .last_sha
+
+          curl -s https://api.github.com/repos/anderwordzkkkz/nuclei-templates/compare/$OLD_SHA...$NEW_SHA \
+          | jq -r '.files[] | select(.status == "added") | .filename' \
+          | grep '\.yaml$' > new_templates.txt || true
+
+          count=$(wc -l < new_templates.txt)
+          echo "count=$count" >> $GITHUB_OUTPUT
+
+      - name: Filter truly new files (no duplicates)
+        run: |
+          mkdir -p .notified
+          touch .notified/history.txt
+
+          # Filter out already notified files
+          if [ -s new_templates.txt ]; then
+            grep -Fxvf .notified/history.txt new_templates.txt > only_new.txt || true
+          else
+            touch only_new.txt
+          fi
+
+          # Update history with new files
+          if [ -s only_new.txt ]; then
+            cat only_new.txt >> .notified/history.txt
+            sort -u .notified/history.txt -o .notified/history.txt
+          fi
+
+      - name: Send Discord Notification (clean)
+        if: success() && steps.compare.outputs.count != '0'
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          if [ ! -s only_new.txt ]; then
+            echo "No new templates to notify"
+            exit 0
+          fi
+
+          MESSAGE="🧩 **New Nuclei YAML Templates Added!**"
+          while read FILE; do
+            MESSAGE="$MESSAGE\n- \`$FILE\` <https://github.com/anderwordzkkkz/nuclei-templates/blob/main/$FILE>"
+          done < only_new.txt
+
+          echo -e "$MESSAGE" | jq -Rs '{content: .}' > payload.json
+
+          curl -H "Content-Type: application/json" \
+               -X POST \
+               -d @payload.json \
+               "$DISCORD_WEBHOOK"
+
+      - name: Save updated SHA & notified list
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: |
+            .last_sha
+            .notified/history.txt
+          key: notification-history-cache
